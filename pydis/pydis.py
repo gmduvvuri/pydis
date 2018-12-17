@@ -13,7 +13,7 @@ e.g. DIS specifics:
 """
 
 import matplotlib
-matplotlib.use('TkAgg')
+#matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
 from matplotlib.widgets import Cursor
@@ -26,7 +26,7 @@ import scipy.signal
 from scipy.interpolate import UnivariateSpline
 from scipy.interpolate import SmoothBivariateSpline
 import warnings
-
+import pdb #JSP - debugging
 # import datetime
 # from matplotlib.widgets import SpanSelector
 
@@ -289,6 +289,8 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
         spatial (Y) direction, then fits polynomial to 1D curve, then
         divides each row in flat by this structure. This nominally divides
         out the spectrum of the flat field lamp. (Default is True)
+    mode: str, optional
+        Default is 'spline'; but can also be 'poly' -- defines the method of fitting used to determine the 1d flat curve when response = True. If 'spline', the 'flat_poly' keyword is not used. 'spline' uses the UnivariateSpline method of scipy.interpolate with ext=0, k=2 ,s=0.001
     trim : bool, optional
         Trim the image using the DATASEC keyword in the header, assuming
         has format of [0:1024,0:512] (Default is True)
@@ -351,8 +353,8 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
     if response is True:
         xdata = np.arange(all_data.shape[1]) # x pixels
 
-        # sum along spatial axis, smooth w/ 5pixel boxcar, take log of summed flux
-        flat_1d = np.log10(convolve(flat_stack.sum(axis=Waxis), Box1DKernel(5)))
+        # median along spatial axis, smooth w/ 5pixel boxcar, take log of summed flux
+        flat_1d = np.log10(convolve(np.nanmedian(flat_stack,axis=Waxis), Box1DKernel(5)))
 
         if mode=='spline':
             spl = UnivariateSpline(xdata, flat_1d, ext=0, k=2 ,s=0.001)

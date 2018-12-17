@@ -5,7 +5,7 @@ for example, an entire night of simple data (autoreduce).
 
 '''
 
-import pydis
+from . import pydis
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm

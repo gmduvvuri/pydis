@@ -7,7 +7,7 @@ Goal: clumsy, slow, effective
 '''
 
 
-import pydis
+from . import pydis
 from astropy.io import fits
 import numpy as np
 import os
