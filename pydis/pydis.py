@@ -386,11 +386,17 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
     if display is True:
         plt.figure()
         plt.imshow(flat, origin='lower',aspect='auto')
+        plt.colorbar()
         plt.show()
 
-    # write output to disk for later use
+    # write output to disk for later use; add fits entries for masks to allow loading flat and mask w/o running flatcombine again
     hduOut = fits.PrimaryHDU(flat)
-    hduOut.writeto(output, overwrite=True)
+    ilumfmask = fits.ImageHDU(ok[0],name="FlatMask")
+    # place holder for actual bad pixel mask -- 1/True in mask is invalid data/pixel -- use to replace bad data with NaNs
+    badmask = fits.ImageHDU(np.zeros_like(flat),name="BadMask")
+
+    hduL = fits.HDUList([hduOut,ilumfmask,badmask])    # use HDUList as container for fits image + masks
+    hduL.writeto(output, overwrite=True)
 
     return flat ,ok[0]
 
@@ -920,7 +926,7 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
 
 
 def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
-               trim=True, fmask=(1,), display=False,
+               trim=True, fmask=(1,), display=False,outputlines=None,
                tol=10, fit_order=2, previous='',mode='poly',
                second_pass=True):
     """
@@ -968,6 +974,10 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
     previous : string, optional
         name of file containing previously identified peaks. Still has to
         do the fitting.
+    outputlines: string, optional
+        for setting name and location of output identified linelist, 
+        defaults to input calimage + '.lines' in working directory
+
 
     Returns
     -------
@@ -977,6 +987,12 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
     """
 
     print('Running HeNeAr_fit function on file '+calimage)
+
+    # set output filename for linelist
+    if outputlines is None:
+        outputlines = calimage+'.lines'
+    else:
+        pass
 
     # silence the polyfit warnings
     warnings.simplefilter('ignore', np.RankWarning)
@@ -1035,7 +1051,7 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
 
         # import the linelist
         linewave = np.genfromtxt(os.path.join(linelists_dir, linelist), dtype='float',
-                              skiprows=1,usecols=(0,),unpack=True)
+                              skip_header=1,usecols=(0,),unpack=True)
 
 
         pcent_pix, wcent_pix = find_peaks(wtemp, slice, pwidth=10, pthreshold=97)
@@ -1079,7 +1095,7 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
                 plt.xlim((min(wtemp),max(wtemp)))
                 plt.show()
 
-        lout = open(calimage+'.lines', 'w')
+        lout = open(outputlines, 'w')
         lout.write("# This file contains the HeNeAr lines identified [auto] Columns: (pixel, wavelength) \n")
         for l in range(len(pcent)):
             lout.write(str(pcent[l]) + ', ' + str(wcent[l])+'\n')
@@ -1139,15 +1155,15 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
                             self.cursor._update()
 
                             # get points nearby to the click
-                            nearby = np.where((wtemp > ix-10*disp_approx) &
-                                              (wtemp < ix+10*disp_approx) )
+                            nearby = np.where((wtemp > ix-12*disp_approx) &
+                                              (wtemp < ix+12*disp_approx) )
 
                             # find if click is too close to an existing click (overlap)
                             kill = None
                             if len(self.pcent)>0:
                                 for k in range(len(self.pcent)):
                                     if np.abs(self.ixlib[k]-ix)<tol:
-                                        kill_d = input('> WARNING: Click too close to existing point. To delete existing point, enter "d"')
+                                        kill_d = input('> WARNING: Click too close to existing point. To delete existing point, enter "d"\n')
                                         if kill_d=='d':
                                             kill = k
                                 if kill is not None:
@@ -1192,10 +1208,21 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
                     else:
                         pass
 
+            #need to turn of interactive mode for InteracWave to proceed properely
+            if matplotlib.is_interactive():
+                print("Momentarily turning off matplotlib interactive mode...")
+                plt.ioff()
+                mplwasinteract = True
+            else:
+                mplwasinteract = False
+            
             # run the interactive program
             wavefit = InteracWave()
             plt.show() #activate the display - GO!
-
+            
+            if mplwasinteract:
+                plt.ion()
+            
             # how I would LIKE to do this interactively:
             # inside the interac mode, do a split panel, live-updated with
             # the wavelength solution, and where user can edit the fit_order
@@ -1206,9 +1233,9 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
             # after interactive fitting done, get results fit peaks
             pcent = np.array(wavefit.pcent,dtype='float')
             wcent = np.array(wavefit.wcent, dtype='float')
-
+            #pdb.set_trace()
             print('> You have identified '+str(len(pcent))+' lines')
-            lout = open(calimage+'.lines', 'w')
+            lout = open(outputlines, 'w')
             lout.write("# This file contains the HeNeAr lines identified [manual] Columns: (pixel, wavelength) \n")
             for l in range(len(pcent)):
                 lout.write(str(pcent[l]) + ', ' + str(wcent[l])+'\n')
@@ -1217,7 +1244,7 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
 
         if (len(previous)>0):
             pcent, wcent = np.genfromtxt(previous, dtype='float',
-                                      unpack=True, skiprows=1,delimiter=',')
+                                      unpack=True, skip_header=1,delimiter=',')
 
 
         #---  FIT SMOOTH FUNCTION ---
@@ -1269,7 +1296,7 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
         linelists_dir = os.path.dirname(os.path.realpath(__file__))+ '/resources/linelists/'
         hireslinelist = 'henear.dat'
         linewave2 = np.genfromtxt(os.path.join(linelists_dir, hireslinelist), dtype='float',
-                               skiprows=1, usecols=(0,), unpack=True)
+                               skip_header=1, usecols=(0,), unpack=True)
 
         tol2 = tol # / 2.0
 
@@ -1315,7 +1342,7 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
                 plt.show()
         wtemp = np.polyval(coeff, (np.arange(len(slice))-len(slice)/2))
 
-        lout = open(calimage+'.lines2', 'w')
+        lout = open(outputlines+'2', 'w')
         lout.write("# This file contains the HeNeAr lines identified [2nd pass] Columns: (pixel, wavelength) \n")
         for l in range(len(pcent2)):
             lout.write(str(pcent2[l]) + ', ' + str(wcent2[l])+'\n')
@@ -1478,12 +1505,12 @@ def AirmassCor(obj_wave, obj_flux, airmass, airmass_file='apoextinct.dat'):
                                 'resources/extinction')
     if len(airmass_file)==0:
         air_wave, air_cor = np.genfromtxt(os.path.join(extinction_dir, airmass_file),
-                                       unpack=True,skiprows=2)
+                                       unpack=True,ski_header=2)
     else:
         print('> Loading airmass library file: '+airmass_file)
         # print('  Note: first 2 rows are skipped, assuming header')
         air_wave, air_cor = np.genfromtxt(os.path.join(extinction_dir, airmass_file),
-                                       unpack=True,skiprows=2)
+                                       unpack=True,skip_header=2)
     # air_cor in units of mag/airmass
     airmass_ext = 10.0**(0.4 * airmass *
                          np.interp(obj_wave, air_wave, air_cor))
@@ -1536,7 +1563,7 @@ def DefFluxCal(obj_wave, obj_flux, stdstar='', mode='spline', polydeg=9,
 
     if os.path.isfile(os.path.join(std_dir, stdstar2)):
         std_wave, std_mag, std_wth = np.genfromtxt(os.path.join(std_dir, stdstar2),
-                                                skiprows=1, unpack=True)
+                                                skip_header=1, unpack=True)
         # standard star spectrum is stored in magnitude units
         std_flux = _mag2flux(std_wave, std_mag)
 
