@@ -526,7 +526,7 @@ def ap_trace(img, fmask=(1,), nsteps=20, interac=False,
 
     yi = np.arange(img.shape[Waxis])[ydata2]
     # define the X-bin edges
-    xbins = np.linspace(0, img.shape[Saxis], nsteps)
+    xbins = np.linspace(0, img.shape[Saxis], nsteps).astype('int')
     ybins = np.zeros_like(xbins)
 
     for i in range(0,len(xbins)-1):
@@ -537,7 +537,7 @@ def ap_trace(img, fmask=(1,), nsteps=20, interac=False,
             zi = img_sm[xbins[i]:xbins[i+1], ydata2].sum(axis=Saxis)
 
         pguess = [np.nanmax(zi), np.nanmedian(zi), yi[np.nanargmax(zi)], 2.]
-        popt,pcov = curve_fit(_gaus, yi[np.isfinite(ztot)], zi[np.isfinite(ztot)], p0=pguess)
+        popt,pcov = curve_fit(_gaus, yi[np.isfinite(zi)], zi[np.isfinite(zi)], p0=pguess)
 
         # if gaussian fits off chip, then use chip-integrated answer
         if (popt[2] <= min(ydata)+25) or (popt[2] >= max(ydata)-25):
@@ -1155,10 +1155,10 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
                             self.cursor._update()
 
                             # get points nearby to the click
-                            nearby = np.where((wtemp > ix-12*disp_approx) &
-                                              (wtemp < ix+12*disp_approx) )
+                            nearby = np.where((wtemp > ix-10*disp_approx) &
+                                              (wtemp < ix+10*disp_approx) )
 
-                            # find if click is too close to an existing click (overlap)
+                            # find if click is too close to an existing click (overlap), doesn't remove previously plotted red circle
                             kill = None
                             if len(self.pcent)>0:
                                 for k in range(len(self.pcent)):
@@ -1217,6 +1217,7 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
                 mplwasinteract = False
             
             # run the interactive program
+            # Note if other plot windows are open prior to beginning this InteracWave they will also need to be closed to proceed
             wavefit = InteracWave()
             plt.show() #activate the display - GO!
             
@@ -1267,10 +1268,12 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
             ax1.plot(xpix, wtemp, 'r')
 
             ax2.plot(pcent, wcent - np.polyval(coeff, pcent),'ro')
+            residual = np.std(wcent - np.polyval(coeff, pcent))
             ax2.set_xlabel('pixel')
             ax1.set_ylabel('wavelength')
             ax2.set_ylabel('residual')
             ax1.set_title('fit_order = '+str(fit_order))
+            ax2.set_title("residual RMS = {0:6.4f}".format(residual))
 
             # ylabel('wavelength')
 
@@ -1366,11 +1369,12 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
                 ax1.plot(xpix, wtemp, 'r')
 
                 ax2.plot(pcent2, wcent2 - np.polyval(coeff, pcent2),'ro')
+                residual = np.std(wcent2 - np.polyval(coeff, pcent2))
                 ax2.set_xlabel('pixel')
                 ax1.set_ylabel('wavelength')
                 ax2.set_ylabel('residual')
                 ax1.set_title('2nd pass, fit_order = '+str(fit_order))
-
+                ax2.set_title("residual RMS = {0:6.4f}".format(residual))
                 # ylabel('wavelength')
 
                 print(" ")
