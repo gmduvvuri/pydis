@@ -141,6 +141,8 @@ class OpenImg(object):
     -------
     image object
     """
+    # maybe there should be an option to feed a dictionary in with the relevant keywords incase for different spectrographs, they don't match the expectations here
+    
     def __init__(self, file, trim=True):
         self.file = file
         self.trim = trim
@@ -178,6 +180,18 @@ class OpenImg(object):
         except KeyError:
             # if these keywords aren't in the header, just return pixel #
             self.wavelength = np.arange(self.data.shape[1])
+
+        try:
+            self.gain = hdu[0].header['GAIN']  # gain in electrons/ ADU
+        except KeyError:
+            self.gain = 1  # gain in electrons/ ADU
+            print("Warning: Missing 'GAIN' keyword in header, check input, setting to unity")
+
+        try:
+            self.rdnoise = hdu[0].header['RDNOISE']  # readnoise in electrons/pix
+        except KeyError:
+            self.rdnoise = 1  # readnoise in electrons/pix
+            print("Warning: Missing 'RDNOISE' keyword in header, check input, setting to zero")
 
         self.exptime = hdu[0].header['EXPTIME']
 
@@ -826,7 +840,7 @@ def lines_to_surface(img, xcent, ycent, wcent,
 
 
 def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
-               coaddN=1):
+               coaddN=1,gain=1.68,rdnoise=4.9):
     """
     1. Extract the spectrum using the trace. Simply add up all the flux
     around the aperture within a specified +/- width.
@@ -879,34 +893,35 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
         the uncertainties of the flux values
     """
 
+    #note that if trace is of integer type then so will onedspec and other output which will give wrong results
     onedspec = np.zeros_like(trace)
     skysubflux = np.zeros_like(trace)
     fluxerr = np.zeros_like(trace)
+    itrace = np.round(trace).astype('int')
 
-    for i in range(0,len(trace)):
+    for i in range(0,len(itrace)):
         #-- first do the aperture flux
         # juuuust in case the trace gets too close to the edge
         widthup = apwidth
         widthdn = apwidth
-        if (trace[i]+widthup > img.shape[0]):
-            widthup = img.shape[0]-trace[i] - 1
-        if (trace[i]-widthdn < 0):
-            widthdn = trace[i] - 1
+        if (itrace[i]+widthup > img.shape[0]):
+            widthup = img.shape[0]-itrace[i] - 1
+        if (itrace[i]-widthdn < 0):
+            widthdn = itrace[i] - 1
 
         # simply add up the total flux around the trace +/- width
-        onedspec[i] = img[trace[i]-widthdn:trace[i]+widthup+1, i].sum()
+        onedspec[i] = img[itrace[i]-widthdn:itrace[i]+widthup+1, i].sum()
 
         #-- now do the sky fit
-        itrace = int(trace[i])
-        y = np.append(np.arange(itrace-apwidth-skysep-skywidth, itrace-apwidth-skysep),
-                      np.arange(itrace+apwidth+skysep+1, itrace+apwidth+skysep+skywidth+1))
+        y = np.append(np.arange(itrace[i]-apwidth-skysep-skywidth, itrace[i]-apwidth-skysep),
+                      np.arange(itrace[i]+apwidth+skysep+1, itrace[i]+apwidth+skysep+skywidth+1))
 
         z = img[y,i]
         if (skydeg>0):
             # fit a polynomial to the sky in this column
             pfit = np.polyfit(y,z,skydeg)
             # define the aperture in this column
-            ap = np.arange(trace[i]-apwidth, trace[i]+apwidth+1)
+            ap = np.arange(itrace[i]-apwidth, itrace[i]+apwidth+1)
             # evaluate the polynomial across the aperture, and sum
             skysubflux[i] = np.sum(np.polyval(pfit, ap))
         elif (skydeg==0):
