@@ -190,14 +190,14 @@ class OpenImg(object):
         try:
             self.rdnoise = hdu[0].header['RDNOISE']  # readnoise in electrons/pix
         except KeyError:
-            self.rdnoise = 1  # readnoise in electrons/pix
+            self.rdnoise = 0  # readnoise in electrons/pix
             print("Warning: Missing 'RDNOISE' keyword in header, check input, setting to zero")
 
         self.exptime = hdu[0].header['EXPTIME']
 
         hdu.close(closed=True)
 
-        # return raw, exptime, airmass, wapprox
+        # return raw, exptime, airmass, wapprox, gain, rdnoise
 
 
 def biascombine(biaslist, output='BIAS.fits', trim=True, silent=True):
@@ -588,7 +588,7 @@ def ap_trace(img, fmask=(1,), nsteps=20, interac=False,
     return my
 
 
-def line_trace(img, pcent, wcent, fmask=(1,), maxbend=10, display=False):
+def line_trace(img, pcent, wcent, fmask=(1,), maxbend=10, display=False,rowcenter=None):
     '''
     Trace the lines of constant wavelength along the spatial dimension.
 
@@ -633,10 +633,18 @@ def line_trace(img, pcent, wcent, fmask=(1,), maxbend=10, display=False):
 
     ybuf = 10
     # split the chip in to 2 parts, above and below the center
-    ydata1 = ydata[np.where((ydata>=img.shape[0]/2) &
+    
+    if rowcenter is None:
+        ydata1 = ydata[np.where((ydata>=img.shape[0]/2) &
                             (ydata<img.shape[0]-ybuf))]
-    ydata2 = ydata[np.where((ydata<img.shape[0]/2) &
+        ydata2 = ydata[np.where((ydata<img.shape[0]/2) &
                             (ydata>ybuf))][::-1]
+    else:
+        ydata1 = ydata[np.where((ydata>=rowcenter) &
+                                (ydata<img.shape[0]-ybuf))]
+        ydata2 = ydata[np.where((ydata<rowcenter) &
+                                (ydata>ybuf))][::-1]
+
 
     # plt.figure()
     # plt.plot(img[img.shape[0]/2,:])
@@ -893,12 +901,23 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
         the uncertainties of the flux values
     """
 
-    #note that if trace is of integer type then so will onedspec and other output which will give wrong results
-    onedspec = np.zeros_like(trace)
-    skysubflux = np.zeros_like(trace)
-    fluxerr = np.zeros_like(trace)
+    #Follow Horne 1986 for optimal extraction
+
+    if rdnoise <= 0:
+        rdnoise = 1
+        print("Inforcing minimum readnoise of 1 electron")
+
+    #note that if trace is of integer type then so will sumspec and other output which will give wrong results
+    sumspec0 = np.zeros(len(trace))
+    varspec0 = np.zeros(len(trace))
+    skyspec0 = np.zeros(len(trace))
+
     itrace = np.round(trace).astype('int')
 
+    varimg = (rdnoise/gain)**2 + np.abs(img.copy())/gain  # for the variance img; in data units
+    skyimg = np.zeros_like(img)   #holds the 2d sky estimate
+
+    # first determine the sky image, and aperature summed spectra
     for i in range(0,len(itrace)):
         #-- first do the aperture flux
         # juuuust in case the trace gets too close to the edge
@@ -909,40 +928,45 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
         if (itrace[i]-widthdn < 0):
             widthdn = itrace[i] - 1
 
-        # simply add up the total flux around the trace +/- width
-        onedspec[i] = img[itrace[i]-widthdn:itrace[i]+widthup+1, i].sum()
-
-        #-- now do the sky fit
+        #y defines the sky pixels
         y = np.append(np.arange(itrace[i]-apwidth-skysep-skywidth, itrace[i]-apwidth-skysep),
-                      np.arange(itrace[i]+apwidth+skysep+1, itrace[i]+apwidth+skysep+skywidth+1))
+              np.arange(itrace[i]+apwidth+skysep+1, itrace[i]+apwidth+skysep+skywidth+1))
 
         z = img[y,i]
         if (skydeg>0):
-            # fit a polynomial to the sky in this column
+        # fit a polynomial to the sky in this column
             pfit = np.polyfit(y,z,skydeg)
+            
             # define the aperture in this column
             ap = np.arange(itrace[i]-apwidth, itrace[i]+apwidth+1)
-            # evaluate the polynomial across the aperture, and sum
-            skysubflux[i] = np.sum(np.polyval(pfit, ap))
+            # evaluate the polynomial across the aperture for estimate
+            skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = np.polyval(pfit, ap)
+            
+            #add contribution to variance image from background subtraction, estimate for fitted background variance based on optimal extraction documentation in iraf
+            varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] +
+                                                                   np.polyval(pfit, ap))/(gain * (len(z)-1))
+    
         elif (skydeg==0):
-            skysubflux[i] = np.nanmean(z)*(apwidth*2.0 + 1)
+            skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = np.nanmean(z)
+            # more sky pixels should yield smaller sky error... # the gain factors are to follow poisson statistics then convert back to data units
+            varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] +
+                                                                np.var(gain*z)/(gain**2 * len(z))
+        elif (skydeg<0):
+            skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = 0
+            print("No background subtraction is being applied")
 
-        #-- finally, compute the error in this pixel
-        sigB = np.std(z) # stddev in the background data
-        N_B = len(y) # number of bkgd pixels
-        N_A = apwidth*2. + 1 # number of aperture pixels
+        #resulting variance img within aperature is variance estimate for Flux - Background; depart from Horne 1986 to include background subtraction in variance estimate for summed 1d spectrum
 
-        # based on aperture phot err description by F. Masci, Caltech:
-        # http://wise2.ipac.caltech.edu/staff/fmasci/ApPhotUncert.pdf
-        fluxerr[i] = np.sqrt(np.sum((onedspec[i]-skysubflux[i])/coaddN) +
-                             (N_A + N_A**2. / N_B) * (sigB**2.))
+        sumspec0[i] = img[itrace[i]-widthdn:itrace[i]+widthup+1,i] - skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i]
+        varspec0[i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i].sum()
+        skyspec0[i] = np.median(skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i])  # just to get idea for what the sky background is
 
-    return onedspec, skysubflux, fluxerr
+    return sumspec0,np.sqrt(varspec0),skyspec0
 
 
 def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
                trim=True, fmask=(1,), display=False,outputlines=None,
-               tol=10, fit_order=2, previous='',mode='poly',
+               tol=10, fit_order=2, previous='',mode='poly',rowcenter=None,
                second_pass=True):
     """
     Determine the wavelength solution to be used for the science images.
@@ -1045,8 +1069,11 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
     # img, _, _, wtemp = OpenImg(calimage, trim=trim)
 
 
-    # take a slice thru the data (+/- 10 pixels) in center row of chip
-    slice = img[int(img.shape[0]/2-10):int(img.shape[0]/2+10),:].sum(axis=0)
+    # take a slice thru the data (+/- 10 pixels) in center row of chip or use rowcenter to define middle for slice
+    if rowcenter is None:
+        slice = img[int(img.shape[0]/2-10):int(img.shape[0]/2+10),:].sum(axis=0)
+    else:
+        slice = img[int(rowcenter-10):int(rowcenter+10),:].sum(axis=0)
 
     # use the header info to do rough solution (linear guess)
     wtemp = (np.arange(len(slice))-len(slice)/2) * disp_approx * sign + wcen_approx
@@ -1406,7 +1433,7 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
                 done = str(input('ENTER: "d" (done) or a # (poly order): '))
 
     #-- trace the peaks vertically --
-    xcent_big, ycent_big, wcent_big = line_trace(img, pcent, wcent,
+    xcent_big, ycent_big, wcent_big = line_trace(img, pcent, wcent, rowcenter=rowcenter,
                                                  fmask=fmask, display=display)
 
     #-- turn these vertical traces in to a whole chip wavelength solution
