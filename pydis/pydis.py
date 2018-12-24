@@ -866,7 +866,7 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
     Parameters
     ----------
     img : 2d numpy array
-        This is the image, stored as a normal numpy array. Can be read in
+        This is the image, stored as a normal numpy array. Should be bias and flat corrected image, not divided by exposure time. Can be read in
         using astropy.io.fits like so:
 
         >>> hdu = fits.open('file.fits') # doctest: +SKIP
@@ -891,14 +891,12 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
 
     Returns
     -------
-    onedspec : 1-d array
-        The summed flux at each column about the trace. Note: is not
-        sky subtracted!
-    skysubflux : 1-d array
-        The integrated sky values along each column, suitable for
-        subtracting from the output of ap_extract
-    fluxerr : 1-d array
-        the uncertainties of the flux values
+    sumspec0 : 1-d array
+        The summed flux at each column about the trace after sky subtraction
+    stdspec0 : 1-d array
+        1d error spectrum of extracted aperture
+    skyspec0 : 1-d array
+        Estimate of the sky spectrum along the trace
     """
 
     #Follow Horne 1986 for optimal extraction
@@ -943,21 +941,19 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
             skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = np.polyval(pfit, ap)
             
             #add contribution to variance image from background subtraction, estimate for fitted background variance based on optimal extraction documentation in iraf
-            varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] +
-                                                                   np.polyval(pfit, ap))/(gain * (len(z)-1))
+            varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] + np.polyval(pfit, ap)/(gain * (len(z)-1))
     
         elif (skydeg==0):
             skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = np.nanmean(z)
             # more sky pixels should yield smaller sky error... # the gain factors are to follow poisson statistics then convert back to data units
-            varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] +
-                                                                np.var(gain*z)/(gain**2 * len(z))
+            varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] + np.var(gain*z)/(gain**2 * len(z))
         elif (skydeg<0):
             skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = 0
             print("No background subtraction is being applied")
 
         #resulting variance img within aperature is variance estimate for Flux - Background; depart from Horne 1986 to include background subtraction in variance estimate for summed 1d spectrum
 
-        sumspec0[i] = img[itrace[i]-widthdn:itrace[i]+widthup+1,i] - skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i]
+        sumspec0[i] = (img[itrace[i]-widthdn:itrace[i]+widthup+1,i] - skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i]).sum()
         varspec0[i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i].sum()
         skyspec0[i] = np.median(skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i])  # just to get idea for what the sky background is
 
@@ -1036,13 +1032,13 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
     # silence the polyfit warnings
     warnings.simplefilter('ignore', np.RankWarning)
 
-    hdu = fits.open(calimage)
+    hdu = fits.open(calimage)  # hdu data is dtype uint16; need to enforce float to prevent bugs later down stream
     if trim is False:
-        img = hdu[0].data
+        img = hdu[0].data.astype('float')
     if trim is True:
         datasec = hdu[0].header['DATASEC'][1:-1].replace(':',',').split(',')
         d = list(map(int, datasec))
-        img = hdu[0].data[d[2]-1:d[3],d[0]-1:d[1]]
+        img = hdu[0].data[d[2]-1:d[3],d[0]-1:d[1]].astype('float')
 
     # this approach will be very DIS specific
     try:
