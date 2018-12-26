@@ -417,7 +417,7 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
 
 def ap_trace(img, fmask=(1,), nsteps=20, interac=False,
              recenter=False, prevtrace=(0,), bigbox=15,
-             Saxis=1, display=False):
+             Saxis=1, display=False,mode='spline',degree=3):
     """
     Trace the spectrum aperture in an image
 
@@ -568,12 +568,17 @@ def ap_trace(img, fmask=(1,), nsteps=20, interac=False,
     mxbins = (xbins[:-1]+xbins[1:]) / 2.
     mybins = ybins[:-1]
 
-    # run a cubic spline thru the bins
-    ap_spl = UnivariateSpline(mxbins, mybins, ext=0, k=3, s=0)
-
-    # interpolate the spline to 1 position per column
     mx = np.arange(0, img.shape[Saxis])
-    my = ap_spl(mx)
+
+    if mode=='spline':
+        # run a cubic spline thru the bins
+        ap_spl = UnivariateSpline(mxbins, mybins, ext=0, k=3, s=0)
+        # interpolate the spline to 1 position per column
+        my = ap_spl(mx)
+    elif mode=='poly':
+        trcoeffs = np.polyfit(mxbins,mybins,degree)
+        my = np.polyval(trcoeffs,mx)
+
 
     if display is True:
         plt.figure()
@@ -847,8 +852,8 @@ def lines_to_surface(img, xcent, ycent, wcent,
     return wfit
 
 
-def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
-               coaddN=1,gain=1.68,rdnoise=4.9):
+def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0
+               ,gain=1.68,rdnoise=4.9,optimal=True,rectified=False):
     """
     1. Extract the spectrum using the trace. Simply add up all the flux
     around the aperture within a specified +/- width.
@@ -903,14 +908,21 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
 
     if rdnoise <= 0:
         rdnoise = 1
-        print("Inforcing minimum readnoise of 1 electron")
+        print("Enforcing minimum readnoise of 1 electron")
 
     #note that if trace is of integer type then so will sumspec and other output which will give wrong results
     sumspec0 = np.zeros(len(trace))
     varspec0 = np.zeros(len(trace))
     skyspec0 = np.zeros(len(trace))
 
-    itrace = np.round(trace).astype('int')
+    if optimal:
+        imgstrip = np.zeros((2*apwidth + 1, len(trace)))
+        varstrip = np.zeros((2*apwidth + 1, len(trace)))
+
+    if rectified:
+        itrace = np.repeat(np.round(np.median(trace)),len(trace)).astype('int')
+    else:
+        itrace = np.round(trace).astype('int')
 
     varimg = (rdnoise/gain)**2 + np.abs(img.copy())/gain  # for the variance img; in data units
     skyimg = np.zeros_like(img)   #holds the 2d sky estimate
@@ -918,7 +930,7 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
     # first determine the sky image, and aperature summed spectra
     for i in range(0,len(itrace)):
         #-- first do the aperture flux
-        # juuuust in case the trace gets too close to the edge
+        # juuuust in case the trace gets too close to the edge; what about the sky aperture in this case??
         widthup = apwidth
         widthdn = apwidth
         if (itrace[i]+widthup > img.shape[0]):
@@ -955,9 +967,107 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0,
 
         sumspec0[i] = (img[itrace[i]-widthdn:itrace[i]+widthup+1,i] - skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i]).sum()
         varspec0[i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i].sum()
-        skyspec0[i] = np.median(skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i])  # just to get idea for what the sky background is
+        skyspec0[i] = np.median(skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i])*(widthup+widthdn + 1)  # just to get idea for what the sky background is
 
-    return sumspec0,np.sqrt(varspec0),skyspec0
+        if optimal:
+            imgstrip[:,i] = img[itrace[i]-widthdn:itrace[i]+widthup+1,i] - skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i]
+            varstrip[:,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i]
+
+    if optimal:
+        # should have keywords passed from call to ap_extract
+        prof2d,spec1d,errspec = OptExtProfile(sumspec0,imgstrip,varstrip)
+        out = (spec1d,errspec,skyspec0)
+    else:
+        out = (sumspec0,np.sqrt(varspec0),skyspec0)
+    
+    return out
+
+
+
+
+
+def OptExtProfile(spec1d,img,varimg,niter=2,degree=3,downsample=1,display=False):
+    """
+    1. Determine the spatial profile for each column to weight the aperture summation to produce 1D spectrum following optimal extraction of Horne 1986
+    
+    Note: implicitly assumes wavelength axis is perfectly vertical within
+    the trace. An important simplification.
+    
+    2. Profile weighting is determined for each row with low order polynomial fit
+
+    3. Computes the uncertainty in each pixel
+    
+    Parameters
+    ----------
+    spec1d: 1d numpy array
+    This is the initial estimate of the object spectrum as a simple summation of counts within the aperature
+    
+    img: 2d numpy array
+    This is the image of the data stored as a normal numpy array. Only pass the aperature portion of the data, is background subtracted.
+    
+    varimg : 2d numpy array
+    This is the image of the variance of the data stored as a normal numpy array. Only pass the aperature portion of the data, includes contrbitution from background estimate
+    
+    niter: scalar integer
+    Used for simple iterative scheme to improve profile estimation
+    
+    degree: scalar integer >= 0
+    Defines the polynomial degree of the dispersion axis row by row fit to determine profile as function of column pixel
+    
+    display: boolean
+    Default is False, set to true to show 2d image of the profile
+    
+    Returns
+    -------
+    prof : 2-d numpy array
+    The resulting profile used to determine the weights along the spatial direction for the summation
+    spectrum : 1-d numpy array
+    1d output spectrum from optimal extraction
+    err : 1-d numpy array
+    1d ouput error spectrum
+    """
+
+    nr,nc= img.shape  #maybe have an axis keyword if the dispersion axis is in other direction, for now assume rows are spatial
+    spec = spec1d.copy()
+    
+    pix = np.arange(nc)
+    prof = np.zeros((nr,nc) ) # initialize variable with profile
+    
+    # replace loop with better iteration criteria, note the variance img is not iterated or updated
+    for l in range(niter):
+        
+        spec_profile = img / np.tile(spec,(nr,1)) # divide spectra by initial estimate to normalize out the spectral features
+        
+        # loop over each row
+        for i in range(nr):
+            temprow = scipy.signal.medfilt(spec_profile[i,:],(9,))[::downsample] #consider using sigma clipping in here as part of iteration
+            xt = pix[::downsample]
+            
+            mask = np.isfinite(temprow)
+            
+            #pdb.set_trace()
+            
+            coeffs = np.polyfit(xt[mask],temprow[mask],degree)  # assumed smoothly varying profile
+            prof[i,:] = np.polyval(coeffs,pix)
+            bottom = (prof[i,:] < 0).nonzero()[0]
+            prof[i,bottom] = 0.  # enforce positivity
+        
+        prof = prof/ np.tile(np.sum(prof,axis=0),(nr,1)) # normalizes the weights
+    
+        spec = np.sum(img*prof/varimg,axis=0) / np.sum(np.power(prof,2)/varimg,axis=0)   #this is the variance weighted summation 'optimal'
+        variance =  np.sum(prof,axis=0) / (np.sum(np.power(prof,2)/varimg,axis=0))
+
+    if display:
+        fig, ax = plt.subplots(2,1)
+        profmap = ax[0].imshow(prof)
+        plt.colorbar(profmap,orientation='horizontal',ax=ax[0])
+        ax[1].plot(np.median(prof,axis=1))
+        ax[1].set_title("Median Profile")
+
+    return prof,spec,np.sqrt(variance)
+
+
+
 
 
 def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
