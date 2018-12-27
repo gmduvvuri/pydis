@@ -283,7 +283,7 @@ def overscanbias(img, cols=(1,), rows=(1,)):
 
 
 def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
-                display=True, flat_poly=5, response=True, Saxis=1):
+                display=True, flat_poly=5, response=True, Saxis=1,badmask=None):
     """
     Combine the flat frames in to a master flat image. Subtracts the
     master bias image first from each flat image. Currently only
@@ -316,6 +316,8 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
     Saxis : int, optional
         Set which axis the spatial dimension is along. 1 = Y axis, 0 = X.
         (Default is 1)
+    badmask: str or 2d-array, optional
+        Used to mask out bad pixels in generation of flat, requires pre-existing badpixel mask
 
     Returns
     -------
@@ -330,6 +332,15 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
         # assume is proper array from biascombine function
         bias_im = bias
 
+    # check for a badpixel mask,  True (1) for bad pixels False (0) for good pixels
+    if badmask is not None:
+        if isinstance(badmask, str):
+        # read in file if a string
+            badpix = fits.open(badmask)[0].data
+        else:
+            # assume it is proper array
+            badpix = badmask
+
     # assume flatlist is a simple text file with image names
     # e.g. ls flat.00*b.fits > bflat.lis
     files = np.genfromtxt(flatlist,dtype=np.str)
@@ -338,13 +349,16 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
         hdu_i = fits.open(files[i])
         if trim is False:
             im_i = hdu_i[0].data - bias_im
-        if trim is True:
+        elif trim is True:
             datasec = hdu_i[0].header['DATASEC'][1:-1].replace(':',',').split(',')
             d = list(map(int, datasec))
             im_i = hdu_i[0].data[d[2]-1:d[3],d[0]-1:d[1]] - bias_im
 
+        if badmask is not None:
+            im_i[badpix.astype('bool')] = np.nan   #use NaN to mask out bad pixels, need to make sure input mask is the right shape, trimmed or not
+
         # check for bad regions (not illuminated) in the spatial direction
-        ycomp = im_i.sum(axis=Saxis) # compress to spatial axis only
+        ycomp = np.nansum(im_i,axis=Saxis) # compress to spatial axis only
         illum_thresh = 0.8 # value compressed data must reach to be used for flat normalization
         ok = np.where( (ycomp>= np.nanmedian(ycomp)*illum_thresh) )
 
@@ -357,7 +371,7 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
 
     # do median across whole stack of flat images
     flat_stack = np.nanmedian(all_data, axis=2)
-
+    #pdb.set_trace()
     # define the wavelength axis
     Waxis = 0
     # add a switch in case the spatial/wavelength axis is swapped
@@ -367,7 +381,7 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
     if response is True:
         xdata = np.arange(all_data.shape[1]) # x pixels
 
-        # median along spatial axis, smooth w/ 5pixel boxcar, take log of summed flux
+        # median along spatial axis, smooth w/ 5pixel boxcar, take log of flux; NaNs ignored in convolve
         flat_1d = np.log10(convolve(np.nanmedian(flat_stack,axis=Waxis), Box1DKernel(5)))
 
         if mode=='spline':
@@ -407,12 +421,16 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
     hduOut = fits.PrimaryHDU(flat)
     ilumfmask = fits.ImageHDU(ok[0],name="FlatMask")
     # place holder for actual bad pixel mask -- 1/True in mask is invalid data/pixel -- use to replace bad data with NaNs
-    badmask = fits.ImageHDU(np.zeros_like(flat),name="BadMask")
+    if badmask is not None:
+        badout = fits.ImageHDU(badpix,name="BadMask")
+    else:
+        badpix = np.zeros_like(flat)
+        badout = fits.ImageHDU(badpix,name="BadMask")
 
-    hduL = fits.HDUList([hduOut,ilumfmask,badmask])    # use HDUList as container for fits image + masks
+    hduL = fits.HDUList([hduOut,ilumfmask,badout])    # use HDUList as container for fits image + masks
     hduL.writeto(output, overwrite=True)
 
-    return flat ,ok[0]
+    return flat ,ok[0], badpix
 
 
 def ap_trace(img, fmask=(1,), nsteps=20, interac=False,
