@@ -25,6 +25,8 @@ from scipy.optimize import curve_fit
 import scipy.signal
 from scipy.interpolate import UnivariateSpline
 from scipy.interpolate import SmoothBivariateSpline
+from astropy.stats import sigma_clip
+from astropy.modeling import models, fitting
 import warnings
 import pdb #JSP - debugging
 # import datetime
@@ -194,6 +196,18 @@ class OpenImg(object):
             print("Warning: Missing 'RDNOISE' keyword in header, check input, setting to zero")
 
         self.exptime = hdu[0].header['EXPTIME']
+        
+        try:
+            self.dateobs = hdu[0].header['DATE-OBS']
+        except KeyError:
+            print("Missing DATE-OBS in header...")
+            self.dateobs = ""
+
+        try:
+            self.timesys = hdu[0].header['TIMESYS'].lower()
+        except KeyError:
+            self.timesys = 'utc'
+            print("Unknown time system, assuming UTC")
 
         hdu.close(closed=True)
 
@@ -420,12 +434,12 @@ def flatcombine(flatlist, bias, output='FLAT.fits', trim=True, mode='spline',
     # write output to disk for later use; add fits entries for masks to allow loading flat and mask w/o running flatcombine again
     hduOut = fits.PrimaryHDU(flat)
     ilumfmask = fits.ImageHDU(ok[0],name="FlatMask")
-    # place holder for actual bad pixel mask -- 1/True in mask is invalid data/pixel -- use to replace bad data with NaNs
-    if badmask is not None:
-        badout = fits.ImageHDU(badpix,name="BadMask")
-    else:
+
+    # place holder for actual bad pixel mask -- 1/True in mask is invalid data/pixel -- use to replace bad data with NaNs, need flat to already exist to match shape
+    if badmask is None:
         badpix = np.zeros_like(flat)
-        badout = fits.ImageHDU(badpix,name="BadMask")
+
+    badout = fits.ImageHDU(badpix,name="BadMask")
 
     hduL = fits.HDUList([hduOut,ilumfmask,badout])    # use HDUList as container for fits image + masks
     hduL.writeto(output, overwrite=True)
@@ -502,7 +516,7 @@ def ap_trace(img, fmask=(1,), nsteps=20, interac=False,
     img_sm = scipy.signal.medfilt2d(img, kernel_size=(5,5))
 
     #--- Pick the strongest source, good if only 1 obj on slit
-    ztot = img_sm.sum(axis=Saxis)[ydata]
+    ztot = np.nansum(img_sm,axis=Saxis)[ydata]
     yi = np.arange(img.shape[Waxis])[ydata]
     peak_y = yi[np.nanargmax(ztot)]
     peak_guess = [np.nanmax(ztot), np.nanmedian(ztot), peak_y, 2.]
@@ -537,9 +551,19 @@ def ap_trace(img, fmask=(1,), nsteps=20, interac=False,
                     return self.xpoint, self.ypoint
                 else:
                     pass
+    
+        if matplotlib.is_interactive():
+            print("Momentarily turning off matplotlib interactive mode...")
+            plt.ioff()
+            mplwasinteract = True
+        else:
+            mplwasinteract = False
 
-        theclick = InteracTrace()
+        theclick = InteracTrace()  #interactive bits don't work properly as is withn matplotlib interactive is on
         plt.show()
+
+        if mplwasinteract:
+            plt.ion()
 
         xcl = theclick.xpoint
         # ycl = theclick.ypoint
@@ -564,9 +588,9 @@ def ap_trace(img, fmask=(1,), nsteps=20, interac=False,
     for i in range(0,len(xbins)-1):
         #-- fit gaussian w/i each window
         if Saxis is 1:
-            zi = img_sm[ydata2, xbins[i]:xbins[i+1]].sum(axis=Saxis)
+            zi = np.nanmean(img_sm[ydata2, xbins[i]:xbins[i+1]],axis=Saxis)
         else:
-            zi = img_sm[xbins[i]:xbins[i+1], ydata2].sum(axis=Saxis)
+            zi = np.nanmean(img_sm[xbins[i]:xbins[i+1], ydata2],axis=Saxis)
 
         pguess = [np.nanmax(zi), np.nanmedian(zi), yi[np.nanargmax(zi)], 2.]
         popt,pcov = curve_fit(_gaus, yi[np.isfinite(zi)], zi[np.isfinite(zi)], p0=pguess)
@@ -911,6 +935,11 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0
     skydeg : int, optional
         The polynomial order to fit between the sky windows.
         (Default is 0)
+    rectified: boolean, optional
+        Used to change behavior of trace. If false, the aperature is extracted at each column centered on peak defined by trace. 
+        If True, the median of the trace is used as center of window with given aperture sizes -- this is reasonable for traces with only slight bend ~ a couple pixes across the dector. Use of rectified helps with optimal extraction to prevent jumps in the estimated profile and weights when trace peak jumps by full pixel value.
+    optimal: boolean, optional
+        Use to allow optimal extraction for variance weighted aperature summation in spectral extraction, following Horne 1986. If false the spectrum is simply the summed flux in the aperture.
 
     Returns
     -------
@@ -962,16 +991,25 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0
 
         z = img[y,i]
         if (skydeg>0):
-        # fit a polynomial to the sky in this column
-            pfit = np.polyfit(y,z,skydeg)
             
-            # define the aperture in this column
-            ap = np.arange(itrace[i]-apwidth, itrace[i]+apwidth+1)
-            # evaluate the polynomial across the aperture for estimate
-            skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = np.polyval(pfit, ap)
-            
-            #add contribution to variance image from background subtraction, estimate for fitted background variance based on optimal extraction documentation in iraf
-            varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] + np.polyval(pfit, ap)/(gain * (len(z)-1))
+            if len(np.where(np.isfinite(z))[0]) > skydeg + 1:
+                # based on fitting with outlier removal from astropy --- API subject to change...
+                polymod = models.Polynomial1D(skydeg)
+                sigmafitting = fitting.FittingWithOutlierRemoval(fitting.LinearLSQFitter(),sigma_clip,niter=4,sigma=2.5)
+                #defaults to 3 iterations, 3 sigma clipping; maybe makes these optional keywords to ap_extract
+                
+                # fit a polynomial to the sky in this column
+                skyfit, polyout = sigmafitting(polymod,y,z)  #can also add weights to this fitting, leaving it off for now
+                
+                ap = np.arange(itrace[i]-apwidth, itrace[i]+apwidth+1) # define the aperture in this column
+                skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = polyout(ap) # evaluate the polynomial across the aperture for sky estimate
+                
+                #add contribution to variance image from background subtraction, estimate for fitted background variance based on optimal extraction documentation in iraf -- approximate
+                varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] + polyout(ap)/(gain * (len(z)-1))
+            else:
+                skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = np.nan
+                print("Warning: empty data array in column {}, skipping sky subtraction here".format(i))
+                    
     
         elif (skydeg==0):
             skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = np.nanmean(z)
@@ -1140,7 +1178,9 @@ def HeNeAr_fit(calimage, linelist='apohenear.dat', interac=True,
     outputlines: string, optional
         for setting name and location of output identified linelist, 
         defaults to input calimage + '.lines' in working directory
-
+    rowcenter: int, optional
+        for determining where to do the initial slice for the central 
+        wavelength solution fitting, defaults to detector shape/2
 
     Returns
     -------
