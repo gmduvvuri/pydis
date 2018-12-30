@@ -965,6 +965,7 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0
     if optimal:
         imgstrip = np.zeros((2*apwidth + 1, len(trace)))
         varstrip = np.zeros((2*apwidth + 1, len(trace)))
+        skyvar =   np.zeros((2*apwidth + 1, len(trace))) #to keep track of sky contribution in variance to pass to optimal extraction
 
     if rectified:
         itrace = np.repeat(np.round(np.median(trace)),len(trace)).astype('int')
@@ -1006,15 +1007,23 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0
                 
                 #add contribution to variance image from background subtraction, estimate for fitted background variance based on optimal extraction documentation in iraf -- approximate
                 varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] + polyout(ap)/(gain * (len(z)-1))
+            
+                if optimal:
+                    skyvar[:,i] = polyout(ap)/(gain * (len(z)-1))
             else:
                 skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = np.nan
                 print("Warning: empty data array in column {}, skipping sky subtraction here".format(i))
-                    
+                if optimal:
+                    skyvar[:,i] = np.nan
     
         elif (skydeg==0):
             skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = np.nanmean(z)
             # more sky pixels should yield smaller sky error... # the gain factors are to follow poisson statistics then convert back to data units
             varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = varimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] + np.var(gain*z)/(gain**2 * len(z))
+
+            if optimal:
+                skyvar[:,i] = np.var(gain*z)/(gain**2 * len(z))
+
         elif (skydeg<0):
             skyimg[itrace[i]-widthdn:itrace[i]+widthup+1,i] = 0
             print("No background subtraction is being applied")
@@ -1031,7 +1040,7 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0
 
     if optimal:
         # should have keywords passed from call to ap_extract
-        prof2d,spec1d,errspec = OptExtProfile(sumspec0,imgstrip,varstrip)
+        prof2d,spec1d,errspec = OptExtProfile(sumspec0,imgstrip,varstrip,skyvar,rdnoise,gain)
         out = (spec1d,errspec,skyspec0)
     else:
         out = (sumspec0,np.sqrt(varspec0),skyspec0)
@@ -1042,7 +1051,7 @@ def ap_extract(img, trace, apwidth=8, skysep=3, skywidth=7, skydeg=0
 
 
 
-def OptExtProfile(spec1d,img,varimg,niter=2,degree=3,downsample=1,display=False):
+def OptExtProfile(spec1d,img0,varimg0,skyvar,rdnoise,gain,degree=3,display=False):
     """
     1. Determine the spatial profile for each column to weight the aperture summation to produce 1D spectrum following optimal extraction of Horne 1986
     
@@ -1056,19 +1065,19 @@ def OptExtProfile(spec1d,img,varimg,niter=2,degree=3,downsample=1,display=False)
     Parameters
     ----------
     spec1d: 1d numpy array
-    This is the initial estimate of the object spectrum as a simple summation of counts within the aperature
+    This is the initial estimate of the object spectrum as a simple summation of counts within the aperature, in data units
     
     img: 2d numpy array
-    This is the image of the data stored as a normal numpy array. Only pass the aperature portion of the data, is background subtracted.
+    This is the image of the data stored as a normal numpy array. Only pass the aperature portion of the data, is background subtracted, in data units.
     
     varimg : 2d numpy array
-    This is the image of the variance of the data stored as a normal numpy array. Only pass the aperature portion of the data, includes contrbitution from background estimate
+    This is the image of the variance of the data stored as a normal numpy array. Only pass the aperature portion of the data, includes contrbitution from background estimate, in data units
     
-    niter: scalar integer
-    Used for simple iterative scheme to improve profile estimation
+    skyvar, 2d numpy array
+    This is an image, same shape as 'img' of the contribution to the variance image from the estimates of the background
     
     degree: scalar integer >= 0
-    Defines the polynomial degree of the dispersion axis row by row fit to determine profile as function of column pixel
+    Defines the polynomial degree of the dispersion axis row by row fit to determine profile as function of column pixel, should be at least 3 for decent results, especially if trace is slightly curved
     
     display: boolean
     Default is False, set to true to show 2d image of the profile
@@ -1082,6 +1091,11 @@ def OptExtProfile(spec1d,img,varimg,niter=2,degree=3,downsample=1,display=False)
     err : 1-d numpy array
     1d ouput error spectrum
     """
+    
+    print("Using Optimal Extraction")
+    
+    img = img0.copy()
+    varimg = varimg0.copy()
 
     nr,nc= img.shape  #maybe have an axis keyword if the dispersion axis is in other direction, for now assume rows are spatial
     spec = spec1d.copy()
@@ -1089,29 +1103,47 @@ def OptExtProfile(spec1d,img,varimg,niter=2,degree=3,downsample=1,display=False)
     pix = np.arange(nc)
     prof = np.zeros((nr,nc) ) # initialize variable with profile
     
-    # replace loop with better iteration criteria, note the variance img is not iterated or updated
-    for l in range(niter):
-        
+    oldmask = np.zeros_like(img).astype('bool')
+    l = 0
+    iteratecrit = True
+    while iteratecrit:
         spec_profile = img / np.tile(spec,(nr,1)) # divide spectra by initial estimate to normalize out the spectral features
+        var_profile = varimg / np.tile(np.power(spec,2),(nr,1))
         
         # loop over each row
         for i in range(nr):
-            temprow = scipy.signal.medfilt(spec_profile[i,:],(9,))[::downsample] #consider using sigma clipping in here as part of iteration
-            xt = pix[::downsample]
+            #median filter of spectral profile as initial smoothing -- replaced with sigma clipping for profile
+            #temprow = scipy.signal.medfilt(spec_profile[i,:],(9,))
+
+            temprow = spec_profile[i,:]
+            nanmask = np.isfinite(temprow)
+
+            polymod = models.Polynomial1D(degree)
+            sigmafit = fitting.FittingWithOutlierRemoval(fitting.LinearLSQFitter(),sigma_clip,niter=3,sigma=3)
             
-            mask = np.isfinite(temprow)
+            _ , polyout = sigmafit(polymod,pix[nanmask],temprow[nanmask],weights=1/var_profile[i,nanmask])  #uses weights
             
-            #pdb.set_trace()
-            
-            coeffs = np.polyfit(xt[mask],temprow[mask],degree)  # assumed smoothly varying profile
-            prof[i,:] = np.polyval(coeffs,pix)
+            prof[i,:] = polyout(pix)
+
             bottom = (prof[i,:] < 0).nonzero()[0]
             prof[i,bottom] = 0.  # enforce positivity
         
         prof = prof/ np.tile(np.sum(prof,axis=0),(nr,1)) # normalizes the weights
     
+        #update variance image:
+        varimg = (rdnoise/gain)**2 + (spec*prof/gain)  + skyvar
+        badmask = np.power(img - np.tile(spec,(nr,1))*prof,2)  > 25*varimg   # 5 sigma overall clipping mask
+
+        badmask = badmask | oldmask
+
+        prof[badmask] = 0  #omit
         spec = np.sum(img*prof/varimg,axis=0) / np.sum(np.power(prof,2)/varimg,axis=0)   #this is the variance weighted summation 'optimal'
         variance =  np.sum(prof,axis=0) / (np.sum(np.power(prof,2)/varimg,axis=0))
+        l += 1
+        #print(l)
+        if (l > 0) & np.all(badmask == oldmask):
+            iteratecrit = False
+        oldmask = badmask.copy()
 
     if display:
         fig, ax = plt.subplots(2,1)
